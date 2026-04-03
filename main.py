@@ -33,8 +33,8 @@ app.add_middleware(
 )
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-OUTPUT_DIR = tempfile.mkdtemp(prefix="dochumanize_out_")
-
+OUTPUT_DIR = "/tmp/dochumanize_outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── WebSocket Connection Manager ─────────────────────────────────────────────
 class ConnectionManager:

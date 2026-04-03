@@ -114,7 +114,8 @@ from evasion import apply_evasion
 # ── Config ────────────────────────────────────────────────────────────────────
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-OUTPUT_DIR = tempfile.mkdtemp(prefix="dochumanize_out_")
+OUTPUT_DIR = "/tmp/dochumanize_outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Max times to retry a single paragraph before accepting best result
 MAX_RETRIES = 3
