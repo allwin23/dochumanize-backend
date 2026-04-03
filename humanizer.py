@@ -18,7 +18,8 @@ Pass 2 — Conversational Degradation:
 import os
 import re
 import time
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from typing import Optional
 
 
@@ -109,11 +110,11 @@ class GeminiHumanizer:
     Implements exponential backoff on rate-limit errors.
     """
 
-    def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
-        self.generation_config = genai.types.GenerationConfig(
-            temperature=0.85,      # High enough for creativity, not too random
+    def __init__(self, api_key: str, model_name: str):
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = model_name
+        self.generation_config = types.GenerateContentConfig(
+            temperature=0.85,
             top_p=0.95,
             top_k=40,
             max_output_tokens=2048,
@@ -123,20 +124,30 @@ class GeminiHumanizer:
         """Call Gemini with exponential backoff for rate-limit / quota errors."""
         for i in range(max_attempts):
             try:
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config=self.generation_config,
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=self.generation_config,
                 )
-                if response.text:
+                
+                # Check if we got a valid text response
+                if response and response.text:
                     return response.text.strip()
-                return None
+                
+                # If no text, we might want to retry or handle it
+                # For now, let's treat it as a failure to trigger the next loop iteration
+                
             except Exception as e:
                 err = str(e).lower()
+                # Check for rate limit or quota issues
                 if "quota" in err or "rate" in err or "429" in err:
-                    wait = (2 ** i) * 5    # 5s, 10s, 20s
+                    wait = (2 ** i) * 5  # 5s, 10s, 20s
                     time.sleep(wait)
+                    continue # Explicitly go to next iteration
                 else:
+                    # Re-raise for unexpected errors (auth, network, etc.)
                     raise
+                    
         return None
 
     def rewrite_structural(
