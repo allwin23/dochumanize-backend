@@ -1,100 +1,59 @@
 """
-tasks.py — Main Celery background task (parallel edition).
+tasks.py — Parallel humanization pipeline with NLP surgery.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHAT THIS FILE DOES (plain English):
+PIPELINE PER PARAGRAPH (9 steps):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When a user uploads a DOCX, this task wakes up in the background
-and runs the full humanization pipeline on every paragraph.
 
-It processes paragraphs IN PARALLEL (8 at a time by default)
-instead of one-by-one, which cuts processing time from hours → minutes.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PIPELINE PER PARAGRAPH (in order):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Step 1 — Cliché Strip
-           Rule-based removal of known AI phrases
-           ("In today's world", "delve into", "leverage", etc.)
-           Done BEFORE sending to Gemini so LLM doesn't reproduce them.
+  Step 1 — Cliché Strip (rule-based)
+           Remove 50+ known AI phrases before Gemini sees the text.
 
   Step 2 — Gemini Pass 1: Structural Rewrite
-           Sends cleaned text to Gemini with strict instructions:
-           - Change sentence structure (passive→active, cleft sentences)
-           - Enforce burstiness (vary sentence lengths: long/short/medium)
-           - Stay within ±5% of original character count
-           - Preserve all facts, terms, and technical content
+           Aggressively restructure syntax, enforce burstiness rhythm,
+           inject rare grammatical constructions, replace AI vocabulary.
 
   Step 3 — Gemini Pass 2: Conversational Degradation
-           Takes Pass 1 output and deliberately roughens it:
-           - Adds discourse markers ("That said,", "Curiously,")
-           - Injects mild hedges ("arguably", "in most cases")
-           - Allows sentence-initial "And" / "But"
-           Makes it sound like a human expert, not a polished AI.
+           Add human reasoning connectives, hedges, mild imperfections.
 
-  Step 4 — Discourse Marker Injection (post-processing)
-           Rule-based layer that adds additional human connectives
-           at sentence boundaries (30% probability per boundary).
+  Step 4 — NLP Surgery (LOCAL — no API call)
+           The most powerful step. Runs after Gemini to fix what LLMs can't:
+             a) POS-aware synonym replacement (rarer vocabulary)
+             b) Sentence splitting to enforce true burstiness
+             c) Parenthetical interruption injection (em-dash asides)
+           This directly attacks perplexity and burstiness signals.
 
-  Step 5 — Micro-Error Seeding (post-processing)
-           Probabilistically injects human stylistic patterns:
-           contractions, em-dashes, sentence fragments.
-           These are invisible to readers but spike perplexity scores.
+  Step 5 — Discourse Marker Injection (post-processing)
+           Probabilistic insertion of reasoning connectives at boundaries.
 
-  Step 6 — Evasion Layer (optional, user-toggled)
-           If evasion_mode=True, injects zero-width spaces and
-           homoglyph character substitutions to confuse tokenizers.
+  Step 6 — Micro-Error Seeding (post-processing)
+           Contractions, em-dashes, sentence-initial "And"/"But".
 
-  Step 7 — Semantic Similarity Check (local SBERT model)
-           Computes cosine similarity between original and rewritten text.
-           If similarity < 0.55 → meaning drifted too far → RETRY.
-           Uses all-MiniLM-L6-v2 running locally (~90MB RAM).
+  Step 7 — Word-Merge Safety Net
+           Strip all invisible characters, fix any merged words.
 
-  Step 8 — AI Detection Check (local RoBERTa model)
-           Scores the rewritten text for AI likelihood [0.0 → 1.0].
-           If score > 0.15 (15%) → still sounds like AI → RETRY.
-           Uses roberta-base-openai-detector running locally (~120MB RAM).
-           Max 3 retries — accepts best candidate if threshold not met.
+  Step 8 — Semantic Similarity Check (local SBERT)
+           Cosine similarity >= 0.55 required. Retry if meaning drifted.
 
-  Step 9 — Reconstruct DOCX
-           Stitches all humanized paragraphs back into the original
-           DOCX XML structure. Tables, images, fonts, layout = untouched.
+  Step 9 — AI Detection Check (local RoBERTa)
+           Score <= 0.15 (15%) required. Retry with more aggression if not.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PARALLEL PROCESSING:
+WHY NLP SURGERY BEATS PROMPT ENGINEERING ALONE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Old (sequential):  Para1(34s) → Para2(34s) → Para3(34s) = 85 min for 150 paras
-  New (parallel):    Para1 ↘
-                     Para2 → all 8 run at once → ~2 min for 150 paras
-                     Para3 ↗
-  Controlled by PARALLEL_WORKERS env var (default: 8).
+  Gemini cannot escape its own output distribution no matter how we prompt it.
+  The NLP surgeon operates BELOW the LLM layer — at raw grammatical structure.
+  It directly modifies the signals (perplexity, burstiness, n-gram patterns)
+  that AI detectors measure, in ways that no LLM can replicate reliably.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHAT YOU WILL SEE IN THE CELERY WORKER TERMINAL:
+PROCESSING:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ============================================================
-    STAGE 1/4 — Parsing document...
-  ============================================================
-    STAGE 1/4 — DONE. 87 paragraphs found.
-
-    ⏱  Estimated time: ~1m 52s (8 parallel workers)
-
-  ============================================================
-    STAGE 3/4 — Humanizing in parallel...
-  ============================================================
-    [██░░░░░░░░░░░░░░░░░░] 10%  Para 9/87 — Started (245 chars)
-      Para 9 | Step 1: Cliché strip done
-      Para 9 | Step 2: Gemini Pass 1...
-      Para 9 | Step 3: Gemini Pass 2...
-      Para 9 | Step 4+5: Discourse + micro-errors injected
-      Para 9 | Step 7: Semantic similarity = 0.74 ✓
-      Para 9 | Step 8: AI score = 11% ✓ PASSED
-    [██░░░░░░░░░░░░░░░░░░] 10%  Para 9/87 — ✓ DONE
-
-    ✅ 9/87 paragraphs complete
+  All paragraphs processed in parallel (PARALLEL_WORKERS threads).
+  Default: 8 workers. 60-page doc (~112 paras) = ~2 minutes.
 """
 
 import os
+import re
 import json
 import tempfile
 import threading
@@ -109,107 +68,95 @@ from humanizer import GeminiHumanizer
 from validator import SemanticValidator, AIDetector
 from cliche_stripper import strip_cliches
 from discourse_injector import inject_discourse_markers, seed_micro_errors
-from evasion import apply_evasion
+from evasion import apply_evasion, strip_evasion
+from nlp_surgeon import NLPSurgeon
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-OUTPUT_DIR = tempfile.mkdtemp(prefix="dochumanize_out_")
-
-# Max times to retry a single paragraph before accepting best result
-MAX_RETRIES = 3
-
-# How many paragraphs to process at the same time.
-# 8 is safe for Gemini free tier without hitting rate limits.
-# Increase to 12-16 if you have a paid Gemini plan.
+REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+OUTPUT_DIR       = tempfile.mkdtemp(prefix="dochumanize_out_")
+MAX_RETRIES      = 3
 PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "8"))
 
 
-# ── Logging helpers ───────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
-def publish(r: redis.Redis, job_id: str, payload: dict):
-    """
-    Push a progress event to the Redis pub/sub channel.
-    The FastAPI WebSocket handler picks this up and forwards it to the browser.
-    """
+def publish(r, job_id, payload):
     r.publish(f"progress:{job_id}", json.dumps(payload))
 
+def log(msg):
+    print(f"\n{'='*60}\n  {msg}\n{'='*60}\n", flush=True)
 
-def log(msg: str):
-    """
-    Print a bold stage-level banner to the Celery worker terminal.
-    Use this for major milestones (stage changes, job complete/fail).
-    """
-    print(f"\n{'='*60}", flush=True)
-    print(f"  {msg}", flush=True)
-    print(f"{'='*60}\n", flush=True)
-
-
-def log_para(para_num: int, total: int, msg: str):
-    """
-    Print a progress bar + paragraph status to the worker terminal.
-    Example:
-      [████░░░░░░░░░░░░░░░░] 20%  Para 4/20 — ✓ DONE
-    """
-    pct = round((para_num / total) * 100)
+def log_para(num, total, msg):
+    pct    = round((num / total) * 100)
     filled = int(pct / 5)
-    bar = "█" * filled + "░" * (20 - filled)
-    print(f"  [{bar}] {pct:3d}%  Para {para_num}/{total} — {msg}", flush=True)
+    bar    = "█" * filled + "░" * (20 - filled)
+    print(f"  [{bar}] {pct:3d}%  Para {num}/{total} — {msg}", flush=True)
+
+def log_step(num, msg):
+    print(f"      Para {num} | {msg}", flush=True)
 
 
-def log_step(para_num: int, msg: str):
+# ── Word-merge safety net ─────────────────────────────────────────────────────
+
+def _fix_word_merging(text: str) -> str:
     """
-    Print a step-level detail line for a specific paragraph.
-    Example:
-      Para 4 | Step 2: Gemini Pass 1...
+    Strip all invisible evasion characters and fix common word-merge patterns.
+    Runs on every paragraph before validation to catch artifacts.
+
+    Common merges fixed:
+      "inpractice" → "in practice"
+      "wemust"     → "we must"
+      "ofthe"      → "of the"
     """
-    print(f"      Para {para_num} | {msg}", flush=True)
+    # Strip ZWS and soft hyphens
+    text = strip_evasion(text)
+
+    # Normalize whitespace
+    text = re.sub(r'[ \t]+', ' ', text)
+
+    # Fix common word-merge patterns caused by invisible character artifacts
+    fixes = [
+        (r'\bin(practice|theory|general|fact|particular|conclusion|addition|contrast|summary)\b',
+         lambda m: 'in ' + m.group(1)),
+        (r'\bof(our|their|its|the|a|an|this|that)\b',
+         lambda m: 'of ' + m.group(1)),
+        (r'\bfor(the|a|an|this|that|these|those|each)\b',
+         lambda m: 'for ' + m.group(1)),
+        (r'\band(the|a|an|this|that|its|their|our)\b',
+         lambda m: 'and ' + m.group(1)),
+        (r'\bwe(must|can|should|will|need|have)\b',
+         lambda m: 'we ' + m.group(1)),
+        (r'\bthis(means|shows|suggests|indicates|requires)\b',
+         lambda m: 'this ' + m.group(1)),
+        (r'\bthat(the|a|an|this|these)\b',
+         lambda m: 'that ' + m.group(1)),
+    ]
+    for pattern, replacement in fixes:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    return text.strip()
 
 
 # ── Single paragraph pipeline ─────────────────────────────────────────────────
 
 def process_single_paragraph(
-    para: dict,
-    para_num: int,
-    total: int,
-    humanizer: GeminiHumanizer,
-    validator: SemanticValidator,
-    detector: AIDetector,
-    evasion_mode: bool,
-    r: redis.Redis,
-    job_id: str,
-    lock: threading.Lock,
-) -> tuple[int, str]:
+    para, para_num, total,
+    humanizer, validator, detector, surgeon,
+    evasion_mode, r, job_id, lock
+):
     """
-    Runs the full 9-step pipeline on a single paragraph.
-    Called from a thread pool — runs in parallel with other paragraphs.
-
-    Args:
-        para        — dict with keys: id, text, style, word_count
-        para_num    — 1-based display number (for logging)
-        total       — total paragraph count (for progress bar)
-        humanizer   — GeminiHumanizer instance (shared across threads, thread-safe)
-        validator   — SemanticValidator instance (shared, thread-safe)
-        detector    — AIDetector instance (shared, thread-safe)
-        evasion_mode — whether to apply zero-width space / homoglyph injection
-        r           — Redis client for publishing WebSocket progress events
-        job_id      — unique job identifier
-        lock        — threading.Lock to prevent interleaved terminal output
-
-    Returns:
-        (para_id, humanized_text) — tuple to be collected by the main task
+    Full 9-step pipeline for one paragraph.
+    Runs in a thread — safe for parallel execution.
+    Returns (para_id, humanized_text).
     """
     para_id  = para["id"]
     original = para["text"]
 
-    # ── Skip short paragraphs (headings, captions, single lines) ─────────────
-    # These are not worth rewriting — too short to have meaningful AI signals
+    # Skip very short paragraphs — not worth rewriting
     if len(original.strip()) < 40:
         with lock:
-            log_para(para_num, total, "SKIPPED — too short to rewrite")
+            log_para(para_num, total, "SKIPPED — too short")
         return (para_id, original)
 
-    # ── Log start + publish WebSocket event ───────────────────────────────────
     with lock:
         log_para(para_num, total, f"Started ({len(original.split())} words)")
         publish(r, job_id, {
@@ -220,173 +167,113 @@ def process_single_paragraph(
             "preview": original[:60] + "...",
         })
 
-    # Track the best rewrite across retries
-    # If we never pass the AI detector, we use the lowest-scoring attempt
-    best_candidate = original   # fallback = keep original if everything fails
-    best_ai_score  = 1.0        # 1.0 = worst possible (fully AI-sounding)
+    best_candidate = original
+    best_ai_score  = 1.0
 
-    # ── Retry loop ────────────────────────────────────────────────────────────
     for attempt in range(MAX_RETRIES):
-
         if attempt > 0:
             with lock:
-                print(f"      Para {para_num} | ↻ Retry {attempt}/{MAX_RETRIES - 1}", flush=True)
-
+                print(f"      Para {para_num} | ↻ Retry {attempt}/{MAX_RETRIES-1}", flush=True)
         try:
-            # ── STEP 1: Cliché Strip ──────────────────────────────────────────
-            # Remove known AI phrases BEFORE sending to Gemini.
-            # This prevents the LLM from seeing and reproducing them.
-            # Examples stripped: "In today's world", "delve into", "leverage",
-            # "it is important to note", "plays a crucial role", etc.
-            with lock:
-                log_step(para_num, "Step 1: Stripping AI clichés...")
+
+            # ── STEP 1: Cliché Strip ──────────────────────────────────────
+            # Remove AI phrases BEFORE Gemini sees them.
+            # Prevents the LLM from seeing and reproducing clichés.
+            with lock: log_step(para_num, "Step 1: Stripping AI clichés...")
             cleaned = strip_cliches(original)
 
-            # ── STEP 2: Gemini Pass 1 — Structural Rewrite ───────────────────
-            # Sends the cleaned text to Gemini with instructions to:
-            #   - Change sentence structure (passive→active, cleft sentences)
-            #   - Vary sentence lengths in a specific rhythm (burstiness)
-            #   - Stay within ±5% of original character count
-            #   - Preserve all facts, proper nouns, technical terms
-            # Higher attempt number = more aggressive restructuring prompt
-            with lock:
-                log_step(para_num, "Step 2: Gemini Pass 1 (structural rewrite)...")
+            # ── STEP 2: Gemini Pass 1 — Structural Rewrite ───────────────
+            # Aggressively restructure syntax. Higher attempt = more aggressive.
+            # Enforces burstiness rhythm, rare structures, vocabulary replacement.
+            with lock: log_step(para_num, "Step 2: Gemini Pass 1 (structural)...")
             pass1 = humanizer.rewrite_structural(
                 text=cleaned,
                 original_char_count=len(original),
                 attempt=attempt,
             )
             if not pass1:
-                with lock:
-                    log_step(para_num, "Step 2: ✗ Pass 1 returned empty — retrying")
+                with lock: log_step(para_num, "Step 2: ✗ Empty response — retrying")
                 continue
 
-            # ── STEP 3: Gemini Pass 2 — Conversational Degradation ───────────
-            # Takes the structurally rewritten text and deliberately roughens it.
-            # Instructions include:
-            #   - Add one discourse marker ("That said,", "Curiously,")
-            #   - Allow sentence-initial "And" or "But"
-            #   - Add mild hedges ("arguably", "in most cases")
-            #   - Allow one intentional fragment for rhythm
-            # This second pass removes the "too polished" quality that AI detectors flag.
-            with lock:
-                log_step(para_num, "Step 3: Gemini Pass 2 (conversational polish)...")
+            # ── STEP 3: Gemini Pass 2 — Conversational Degradation ───────
+            # Add human reasoning markers, hedges, mild imperfections.
+            # Removes the "too polished" quality that detectors flag.
+            with lock: log_step(para_num, "Step 3: Gemini Pass 2 (conversational)...")
             pass2 = humanizer.rewrite_conversational(text=pass1, attempt=attempt)
             if not pass2:
-                with lock:
-                    log_step(para_num, "Step 3: ✗ Pass 2 returned empty — retrying")
+                with lock: log_step(para_num, "Step 3: ✗ Empty response — retrying")
                 continue
 
-            # ── STEP 4: Discourse Marker Injection ───────────────────────────
-            # Rule-based post-processing layer.
-            # Walks sentence boundaries and probabilistically inserts
-            # human reasoning connectives (30% chance per boundary):
-            # "That said,", "Worth noting here is that", "The trouble is,", etc.
-            # These connectives are rare in AI output and boost human-likeness scores.
-            with lock:
-                log_step(para_num, "Step 4: Injecting discourse markers...")
-            enriched = inject_discourse_markers(pass2)
+            # ── STEP 4: NLP Surgery ───────────────────────────────────────
+            # LOCAL processing — no API call.
+            # Directly attacks perplexity and burstiness signals:
+            #   a) POS-aware synonym replacement (rarer vocabulary)
+            #   b) Sentence splitting (true burstiness enforcement)
+            #   c) Parenthetical em-dash injection
+            # This is what actually gets us below 15%.
+            with lock: log_step(para_num, "Step 4: NLP surgery (synonyms + burstiness + parentheticals)...")
+            surgered = surgeon.operate(pass2)
 
-            # ── STEP 5: Micro-Error Seeding ───────────────────────────────────
-            # Injects subtle human stylistic patterns that AI detectors
-            # cannot penalise without also flagging real human writing:
-            #   - Contractions (does not → doesn't)
-            #   - Em-dash interruptions (comma → em-dash)
-            #   - Sentence-initial conjunctions (And / But)
-            # Applied probabilistically (~20% of eligible positions).
-            with lock:
-                log_step(para_num, "Step 5: Seeding micro-errors...")
+            # ── STEP 5: Discourse Marker Injection ───────────────────────
+            # Rule-based: insert reasoning connectives at sentence boundaries.
+            # 25% probability per eligible boundary.
+            with lock: log_step(para_num, "Step 5: Injecting discourse markers...")
+            enriched = inject_discourse_markers(surgered)
+
+            # ── STEP 6: Micro-Error Seeding ───────────────────────────────
+            # Contractions, em-dashes, sentence-initial "And"/"But".
+            # Impossible for detectors to flag without flagging real human text.
+            with lock: log_step(para_num, "Step 6: Seeding micro-errors...")
             enriched = seed_micro_errors(enriched)
 
-            # ── STEP 6: Evasion Layer (optional) ─────────────────────────────
-            # Only runs if user enabled evasion_mode toggle.
-            # Injects invisible Unicode characters:
-            #   - Zero-width spaces (U+200B) at 8% of word boundaries
-            #   - Homoglyph substitutions (Latin 'e' → Cyrillic 'е') at 3%
-            #   - Soft hyphens (U+00AD) inside long words at 10%
-            # Text looks identical to humans but breaks AI detector tokenization.
-            # Safety net: fix any word-merging before validation
+            # ── STEP 6b: Evasion Layer (optional) ────────────────────────
+            if evasion_mode:
+                with lock: log_step(para_num, "Step 6b: Evasion layer (ZWS + homoglyphs)...")
+                enriched = apply_evasion(enriched)
+
+            # ── STEP 7: Word-Merge Safety Net ─────────────────────────────
+            # Strip all invisible characters, fix merged words.
+            # Ensures clean readable output before validation.
             enriched = _fix_word_merging(enriched)
 
-            if evasion_mode:
-                with lock:
-                    log_step(para_num, "Step 6: Applying evasion layer (ZWS + homoglyphs)...")
-                enriched = apply_evasion(enriched)
-            else:
-                with lock:
-                    log_step(para_num, "Step 6: Evasion layer OFF (skipped)")
-
-            # ── STEP 7: Semantic Similarity Check ────────────────────────────
-            # Uses local SBERT model (all-MiniLM-L6-v2, ~90MB RAM).
-            # Encodes both original and rewritten text as vectors,
-            # then computes cosine similarity [0.0 → 1.0].
-            #
-            # Thresholds:
-            #   >= 0.55 → meaning preserved → proceed to AI detection
-            #   <  0.55 → meaning drifted too far → RETRY
-            #
-            # Why 0.55? Below this, the rewrite has likely hallucinated
-            # new facts or omitted critical information.
-            with lock:
-                log_step(para_num, "Step 7: Checking semantic similarity (SBERT)...")
+            # ── STEP 8: Semantic Similarity Check ─────────────────────────
+            # Local SBERT model. Cosine similarity >= 0.55 required.
+            # Ensures meaning was preserved — facts, terms, content intact.
+            with lock: log_step(para_num, "Step 8: Semantic similarity check (SBERT)...")
             similarity = validator.cosine_similarity(original, enriched)
 
             if similarity < 0.55:
                 with lock:
-                    log_step(para_num, f"Step 7: ✗ FAILED — similarity {similarity:.2f} < 0.55 (meaning drifted) — retrying")
-                    publish(r, job_id, {
-                        "event": "retry",
-                        "para": para_num,
-                        "reason": f"Semantic drift (sim={similarity:.2f})",
-                    })
+                    log_step(para_num, f"Step 8: ✗ FAILED — sim={similarity:.2f} < 0.55 — retrying")
+                    publish(r, job_id, {"event": "retry", "para": para_num,
+                                        "reason": f"Semantic drift ({similarity:.2f})"})
                 continue
             else:
-                with lock:
-                    log_step(para_num, f"Step 7: ✓ PASSED — similarity {similarity:.2f}")
+                with lock: log_step(para_num, f"Step 8: ✓ PASSED — sim={similarity:.2f}")
 
-            # ── STEP 8: AI Detection Check ────────────────────────────────────
-            # Uses local RoBERTa model (roberta-base-openai-detector, ~120MB RAM).
-            # Scores the rewritten text: 0.0 = human, 1.0 = AI-generated.
-            #
-            # Thresholds:
-            #   <= 0.15 (15%) → passes as human → done, move to next paragraph
-            #   >  0.15       → still sounds like AI → RETRY with more aggression
-            #
-            # Best candidate across all retries is always saved.
-            # If we exhaust MAX_RETRIES without passing, we use the
-            # lowest-scoring attempt rather than reverting to original.
-            with lock:
-                log_step(para_num, "Step 8: Running AI detection (local RoBERTa)...")
+            # ── STEP 9: AI Detection Check ─────────────────────────────────
+            # Local RoBERTa model. Score <= 0.15 (15%) required.
+            # Retries with increasing aggression if score too high.
+            with lock: log_step(para_num, "Step 9: AI detection check (RoBERTa)...")
             ai_score = detector.score(enriched)
 
-            # Always save the best result we've seen so far
             if ai_score < best_ai_score:
                 best_ai_score  = ai_score
                 best_candidate = enriched
 
             if ai_score <= 0.15:
-                with lock:
-                    log_step(para_num, f"Step 8: ✓ PASSED — AI score {ai_score:.0%} (under 15% target)")
-                break   # exit retry loop — this paragraph is done
+                with lock: log_step(para_num, f"Step 9: ✓ PASSED — AI score {ai_score:.0%} ✅")
+                break
             else:
                 with lock:
-                    log_step(para_num, f"Step 8: ✗ FAILED — AI score {ai_score:.0%} (over 15%) — retrying")
-                    publish(r, job_id, {
-                        "event": "retry",
-                        "para": para_num,
-                        "reason": f"AI score {ai_score:.0%} > 15%",
-                    })
+                    log_step(para_num, f"Step 9: ✗ FAILED — AI score {ai_score:.0%} > 15% — retrying")
+                    publish(r, job_id, {"event": "retry", "para": para_num,
+                                        "reason": f"AI score {ai_score:.0%}"})
 
         except Exception as e:
-            # Don't let one paragraph crash the whole job.
-            # Log the error, skip this attempt, and retry.
-            with lock:
-                log_step(para_num, f"✗ Exception on attempt {attempt + 1}: {e}")
+            with lock: log_step(para_num, f"✗ Exception attempt {attempt+1}: {e}")
             continue
 
-    # ── End of retry loop ─────────────────────────────────────────────────────
-    # Use whichever attempt scored lowest on AI detection.
-    # Even if we never hit the 15% target, a 40% score is better than 100%.
     with lock:
         log_para(para_num, total, f"✓ DONE — best AI score: {best_ai_score:.0%}")
 
@@ -396,210 +283,103 @@ def process_single_paragraph(
 # ── Main Celery task ──────────────────────────────────────────────────────────
 
 @celery_app.task(bind=True, name="tasks.humanize_document")
-def humanize_document(
-    self: Task,
-    input_path: str,
-    gemini_key: str,
-    hf_token: str,
-    job_id: str,
-    evasion_mode: bool = False,
-):
+def humanize_document(self: Task, input_path, gemini_key, hf_token,
+                       job_id, evasion_mode=False):
     """
-    Root Celery task. Called when a document is uploaded via POST /upload.
-
-    Args:
-        input_path  — path to the uploaded .docx on disk (temp file)
-        gemini_key  — user's Gemini API key (BYOK, never stored)
-        hf_token    — user's HuggingFace token (kept for API compatibility,
-                      not used since detector now runs locally)
-        job_id      — UUID for this job, used for WebSocket pub/sub channel
-        evasion_mode — if True, apply zero-width space + homoglyph injection
-
-    Flow:
-        Stage 1 — Parse DOCX → extract paragraph map
-        Stage 2 — Load AI models (SBERT + RoBERTa)
-        Stage 3 — Process all paragraphs in parallel (ThreadPoolExecutor)
-        Stage 4 — Reconstruct DOCX with humanized text
-        Stage 5 — Publish done event → user downloads file
+    Root Celery task. Orchestrates the full parallel humanization pipeline.
+    Called when user uploads a DOCX via POST /upload.
     """
     r = redis.from_url(REDIS_URL, decode_responses=True)
 
     try:
-        # ── STAGE 1: Parse DOCX ───────────────────────────────────────────────
-        # Opens the .docx file and walks the XML to find all paragraphs
-        # that are eligible for rewriting (body text, not tables/images/headings).
-        # Each paragraph gets a unique ID and is stored in a map.
-        log("STAGE 1/4 — Parsing DOCX structure...")
+        # ── STAGE 1: Parse DOCX ───────────────────────────────────────────
+        # Extract all rewritable paragraphs from the DOCX XML.
+        # Freezes tables, images, headings, textboxes — only body text rewritten.
+        log("STAGE 1/4 — Parsing DOCX...")
         publish(r, job_id, {"event": "stage", "msg": "Parsing document..."})
 
         parser        = DocxParser(input_path)
         paragraph_map = parser.extract_paragraphs()
         total         = len(paragraph_map)
 
-        log(f"STAGE 1/4 — DONE. Found {total} paragraphs eligible for rewriting.")
-        publish(r, job_id, {
-            "event": "parsed",
-            "total_paras": total,
-            "msg": f"Found {total} paragraphs.",
-        })
+        log(f"STAGE 1/4 — DONE. {total} paragraphs found.")
+        publish(r, job_id, {"event": "parsed", "total_paras": total})
 
-        # ── STAGE 2: Load AI models ───────────────────────────────────────────
-        # Initialise all pipeline components.
-        # Models are lazy-loaded with @lru_cache so they load once per worker
-        # process and stay in memory for subsequent tasks — no repeated downloads.
-        log("STAGE 2/4 — Initialising pipeline components...")
-
+        # ── STAGE 2: Initialise pipeline ──────────────────────────────────
+        # All models use @lru_cache — load once, stay in memory.
+        # SBERT ~90MB + RoBERTa ~120MB + PyTorch overhead = ~430MB total.
+        log("STAGE 2/4 — Loading pipeline components...")
         humanizer = GeminiHumanizer(api_key=gemini_key)
-        # GeminiHumanizer: wraps the Gemini API client, holds the two prompt builders
+        validator  = SemanticValidator()
+        detector   = AIDetector()
+        surgeon    = NLPSurgeon()   # no model loading needed — pure Python NLP
 
-        validator = SemanticValidator()
-        # SemanticValidator: loads SBERT all-MiniLM-L6-v2 (~90MB) on first call
+        est_secs = (total / PARALLEL_WORKERS) * 8
+        log(f"STAGE 2/4 — DONE. Ready.")
+        print(f"\n  ⏱  Est. time: ~{int(est_secs//60)}m {int(est_secs%60)}s "
+              f"({PARALLEL_WORKERS} parallel workers)\n", flush=True)
 
-        detector = AIDetector()
-        # AIDetector: loads roberta-base-openai-detector (~120MB) on first call
-
-        # Estimate processing time for user feedback
-        est_seconds = (total / PARALLEL_WORKERS) * 8
-        est_mins    = int(est_seconds // 60)
-        est_secs    = int(est_seconds % 60)
-
-        log(f"STAGE 2/4 — DONE. Ready to process {total} paragraphs.")
-        print(f"\n  ⏱  Estimated time: ~{est_mins}m {est_secs}s ({PARALLEL_WORKERS} parallel workers)\n", flush=True)
-
-        # ── STAGE 3: Parallel humanization ───────────────────────────────────
-        # This is the main processing stage.
-        # ThreadPoolExecutor submits all paragraphs as independent tasks.
-        # Up to PARALLEL_WORKERS paragraphs run simultaneously.
-        # A threading.Lock prevents interleaved/garbled terminal output.
-        # Results are collected as futures complete (not in order — order restored later).
-        log(f"STAGE 3/4 — Humanizing {total} paragraphs ({PARALLEL_WORKERS} at a time)...")
+        # ── STAGE 3: Parallel humanization ───────────────────────────────
+        # ThreadPoolExecutor submits all paragraphs simultaneously.
+        # Lock prevents interleaved terminal output from threads.
+        log(f"STAGE 3/4 — Humanizing {total} paragraphs in parallel...")
         publish(r, job_id, {"event": "stage", "msg": f"Humanizing {total} paragraphs..."})
 
-        results = {}          # para_id → final humanized text
-        lock    = threading.Lock()   # prevents garbled output from concurrent threads
-        completed_count = 0
+        results   = {}
+        lock      = threading.Lock()
+        completed = 0
 
         with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-
-            # Submit all paragraphs to the thread pool at once
-            # Each future maps back to its para_id for error recovery
             futures = {
                 executor.submit(
                     process_single_paragraph,
-                    para,           # paragraph dict (id, text, style, word_count)
-                    idx + 1,        # 1-based para number for display
-                    total,          # total count for progress bar
-                    humanizer,      # shared Gemini client (thread-safe)
-                    validator,      # shared SBERT model (thread-safe)
-                    detector,       # shared RoBERTa model (thread-safe)
-                    evasion_mode,   # evasion toggle
-                    r,              # Redis client for WebSocket events
-                    job_id,         # job UUID
-                    lock,           # output lock
+                    para, idx+1, total,
+                    humanizer, validator, detector, surgeon,
+                    evasion_mode, r, job_id, lock
                 ): para["id"]
                 for idx, para in enumerate(paragraph_map)
             }
 
-            # Collect results as each thread completes (order doesn't matter here —
-            # results dict uses para_id as key, order restored in Stage 4)
             for future in as_completed(futures):
                 try:
-                    para_id, humanized_text = future.result()
-                    results[para_id] = humanized_text
-                    completed_count += 1
-                    print(f"\n  ✅ {completed_count}/{total} paragraphs complete\n", flush=True)
-
+                    para_id, text = future.result()
+                    results[para_id] = text
+                    completed += 1
+                    print(f"\n  ✅ {completed}/{total} paragraphs complete\n", flush=True)
                 except Exception as e:
-                    # If a paragraph's thread crashes entirely, fall back to original text
                     para_id = futures[future]
-                    print(f"\n  ❌ Para {para_id} thread crashed: {e} — keeping original text\n", flush=True)
-                    original = next(
-                        (p["text"] for p in paragraph_map if p["id"] == para_id),
-                        ""
-                    )
+                    original = next((p["text"] for p in paragraph_map if p["id"] == para_id), "")
                     results[para_id] = original
-                    completed_count += 1
+                    completed += 1
+                    print(f"\n  ❌ Para {para_id} failed: {e} — kept original\n", flush=True)
 
-        log(f"STAGE 3/4 — DONE. All {total} paragraphs processed.")
+        log("STAGE 3/4 — DONE. All paragraphs processed.")
 
-        # ── STAGE 4: Reconstruct DOCX ─────────────────────────────────────────
-        # Takes the results dict {para_id: humanized_text} and surgically
-        # replaces the text nodes in the original DOCX XML.
-        # Everything else (tables, images, fonts, page layout) is untouched.
-        # The output file is saved to OUTPUT_DIR for the download endpoint.
-        log("STAGE 4/4 — Rebuilding DOCX with humanized text...")
+        # ── STAGE 4: Reconstruct DOCX ─────────────────────────────────────
+        # Surgically replace text nodes in original XML.
+        # Fonts, layout, images, tables = completely untouched.
+        log("STAGE 4/4 — Rebuilding DOCX...")
         publish(r, job_id, {"event": "stage", "msg": "Rebuilding document..."})
 
         out_path = os.path.join(OUTPUT_DIR, f"{job_id}_humanized.docx")
         parser.reconstruct(results, out_path)
 
-        # ── STAGE 5: Done ─────────────────────────────────────────────────────
-        log(f"✅ JOB COMPLETE — File ready at /download/{job_id}")
+        log(f"✅ JOB COMPLETE — /download/{job_id}")
         publish(r, job_id, {
             "event": "done",
             "download_url": f"/download/{job_id}",
-            "msg": "Humanization complete. Your document is ready.",
+            "msg": "Done. Your humanized document is ready.",
         })
-
         return {"status": "done", "output": out_path}
 
     except Exception as exc:
-        # Top-level catch — log clearly and re-raise so Celery marks job as FAILURE
-        log(f"❌ JOB FAILED — {str(exc)}")
+        log(f"❌ JOB FAILED — {exc}")
         publish(r, job_id, {"event": "error", "detail": str(exc)})
         raise
 
     finally:
-        # Always clean up the uploaded temp file regardless of success/failure
-        # The output file is kept (for download) — only the input is deleted
         try:
             os.remove(input_path)
         except OSError:
             pass
         r.close()
-
-
-# ── Post-processing safety net ────────────────────────────────────────────────
-
-def _fix_word_merging(text: str) -> str:
-    """
-    Safety net: detect and fix word-merging artifacts.
-
-    Catches cases where zero-width spaces or other invisible characters
-    caused words to appear merged (e.g., "inpractice", "wemust").
-
-    Strategy:
-    1. Strip all zero-width characters
-    2. Ensure single space between all words
-    3. Fix camelCase-style merges using a dictionary word boundary heuristic
-    """
-    from evasion import strip_evasion
-
-    # Step 1: Strip all invisible evasion characters first
-    text = strip_evasion(text)
-
-    # Step 2: Normalize whitespace — collapse multiple spaces, fix missing spaces
-    text = re.sub(r'[ \t]+', ' ', text)          # collapse multiple spaces
-    text = re.sub(r'\n{3,}', '\n\n', text)        # max 2 newlines
-
-    # Step 3: Fix common word-merging patterns
-    # Catches cases like "inpractice" → "in practice", "wemust" → "we must"
-    merging_fixes = [
-        (r'\bin(practice|theory|general|fact|particular|conclusion|addition|contrast|summary)\b',
-         lambda m: 'in ' + m.group(1)),
-        (r'\bwe(must|can|should|will|need|have)\b',
-         lambda m: 'we ' + m.group(1)),
-        (r'\bthis(means|shows|suggests|indicates|implies|requires)\b',
-         lambda m: 'this ' + m.group(1)),
-        (r'\bof(our|their|its|the|a|an)\b',
-         lambda m: 'of ' + m.group(1)),
-        (r'\bfor(the|a|an|this|that|these|those|each|every|all)\b',
-         lambda m: 'for ' + m.group(1)),
-        (r'\band(the|a|an|this|that|these|those|its|their|our)\b',
-         lambda m: 'and ' + m.group(1)),
-    ]
-
-    for pattern, replacement in merging_fixes:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-
-    return text.strip()
