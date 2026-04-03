@@ -34,4 +34,5 @@ celery_app.conf.update(
     result_expires=7_200,
 
     # Routing
-    task_default_queue="humanize"444
+    task_default_queue="humanize",
+)

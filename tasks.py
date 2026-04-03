@@ -114,8 +114,7 @@ from evasion import apply_evasion
 # ── Config ────────────────────────────────────────────────────────────────────
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-OUTPUT_DIR = "/tmp/dochumanize_outputs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+OUTPUT_DIR = tempfile.mkdtemp(prefix="dochumanize_out_")
 
 # Max times to retry a single paragraph before accepting best result
 MAX_RETRIES = 3
@@ -306,6 +305,9 @@ def process_single_paragraph(
             #   - Homoglyph substitutions (Latin 'e' → Cyrillic 'е') at 3%
             #   - Soft hyphens (U+00AD) inside long words at 10%
             # Text looks identical to humans but breaks AI detector tokenization.
+            # Safety net: fix any word-merging before validation
+            enriched = _fix_word_merging(enriched)
+
             if evasion_mode:
                 with lock:
                     log_step(para_num, "Step 6: Applying evasion layer (ZWS + homoglyphs)...")
@@ -555,3 +557,49 @@ def humanize_document(
         except OSError:
             pass
         r.close()
+
+
+# ── Post-processing safety net ────────────────────────────────────────────────
+
+def _fix_word_merging(text: str) -> str:
+    """
+    Safety net: detect and fix word-merging artifacts.
+
+    Catches cases where zero-width spaces or other invisible characters
+    caused words to appear merged (e.g., "inpractice", "wemust").
+
+    Strategy:
+    1. Strip all zero-width characters
+    2. Ensure single space between all words
+    3. Fix camelCase-style merges using a dictionary word boundary heuristic
+    """
+    from evasion import strip_evasion
+
+    # Step 1: Strip all invisible evasion characters first
+    text = strip_evasion(text)
+
+    # Step 2: Normalize whitespace — collapse multiple spaces, fix missing spaces
+    text = re.sub(r'[ \t]+', ' ', text)          # collapse multiple spaces
+    text = re.sub(r'\n{3,}', '\n\n', text)        # max 2 newlines
+
+    # Step 3: Fix common word-merging patterns
+    # Catches cases like "inpractice" → "in practice", "wemust" → "we must"
+    merging_fixes = [
+        (r'\bin(practice|theory|general|fact|particular|conclusion|addition|contrast|summary)\b',
+         lambda m: 'in ' + m.group(1)),
+        (r'\bwe(must|can|should|will|need|have)\b',
+         lambda m: 'we ' + m.group(1)),
+        (r'\bthis(means|shows|suggests|indicates|implies|requires)\b',
+         lambda m: 'this ' + m.group(1)),
+        (r'\bof(our|their|its|the|a|an)\b',
+         lambda m: 'of ' + m.group(1)),
+        (r'\bfor(the|a|an|this|that|these|those|each|every|all)\b',
+         lambda m: 'for ' + m.group(1)),
+        (r'\band(the|a|an|this|that|these|those|its|their|our)\b',
+         lambda m: 'and ' + m.group(1)),
+    ]
+
+    for pattern, replacement in merging_fixes:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    return text.strip()
