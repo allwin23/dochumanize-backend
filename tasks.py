@@ -75,7 +75,7 @@ def humanize_document(
         # ── Stage 2: Initialize pipeline components ───────────────────────
         humanizer = GeminiHumanizer(api_key=gemini_key)
         validator = SemanticValidator()
-        detector = AIDetector(hf_token=hf_token)
+        detector = AIDetector()
 
         results: dict[int, str] = {}     # para_id → humanized text
 
