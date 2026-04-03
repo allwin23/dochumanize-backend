@@ -106,11 +106,12 @@ def _build_pass2_prompt(text: str, attempt: int) -> str:
 class GeminiHumanizer:
     """
     Handles both rewrite passes using the Google Gemini API.
-    Uses gemini-1.5-flash for speed and cost efficiency.
+    Uses gemini-3.1-pro-preview for top-tier reasoning and structural rewriting.
     Implements exponential backoff on rate-limit errors.
     """
 
-    def __init__(self, api_key: str, model_name: str):
+    # Added the default model parameter here so tasks.py doesn't need to be changed
+    def __init__(self, api_key: str, model_name: str = "gemini-3.1-pro-preview"):
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
         self.generation_config = types.GenerateContentConfig(
@@ -134,8 +135,7 @@ class GeminiHumanizer:
                 if response and response.text:
                     return response.text.strip()
                 
-                # If no text, we might want to retry or handle it
-                # For now, let's treat it as a failure to trigger the next loop iteration
+                # If no text, treat it as a failure to trigger the next loop iteration
                 
             except Exception as e:
                 err = str(e).lower()
