@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-format_doc.py — Post-humanization formatting fixer for .docx files.
+format_doc.py — Complete report formatter. Run AFTER humanize_doc.py.
 
-Does NOT touch text content at all. Only fixes:
-  1. Paragraph justification (body text → fully justified)
-  2. Font consistency (Times New Roman 12pt on body paragraphs)
-  3. Line spacing normalization (1.5 on body text)
-  4. Indentation consistency  
-  5. Heading spacing cleanup
-  6. TOC entries — inject Word auto-TOC field to replace manual "…….1" strings
-  7. LibreOffice headless refresh to repaginate and update TOC page numbers
+What it does (never touches text content):
+  1.  Remove all stray empty paragraphs between headings
+  2.  Chapter titles (CHAPTER X, ABSTRACT, etc.) always start on a new page
+  3.  Body paragraph justification, font, line-spacing normalized
+  4.  Heading spacing normalized (space-before / space-after)
+  5.  Widow/orphan control on body text
+  6.  Replace manual TOC with Word auto-field (press F9 in Word to update)
+  7.  LibreOffice headless refresh for repagination (if installed)
 
 Usage:
     python3 format_doc.py input.docx output.docx
-    python3 format_doc.py input.docx output.docx --no-toc      # skip TOC rebuild
-    python3 format_doc.py input.docx output.docx --no-refresh  # skip LibreOffice
-    python3 format_doc.py input.docx output.docx --report      # show what will change
+    python3 format_doc.py input.docx output.docx --report   # dry-run
+    python3 format_doc.py input.docx output.docx --no-toc
+    python3 format_doc.py input.docx output.docx --no-refresh
 
 Requires:
-    pip install python-docx
-    apt install libreoffice   (for TOC repagination — optional)
+    pip install python-docx lxml
+    apt install libreoffice   (optional — for TOC page-number refresh)
 """
 
 import argparse
@@ -34,83 +34,55 @@ from pathlib import Path
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt
 from lxml import etree
 
 
-# ─── FORMATTING CONSTANTS (extracted from original document) ─────────────────
+# ─── FORMATTING CONSTANTS (extracted from this document) ─────────────────────
 
-BODY_FONT_NAME    = "Times New Roman"
-BODY_FONT_SIZE_PT = 12.0          # 12pt = 240 half-points = sz val 24
-BODY_LINE_SPACING = 360           # twips: 360 = 1.5 lines (240 twips = single)
-BODY_LINE_RULE    = "auto"
-BODY_SPACE_BEFORE = 191           # twips (~10pt)
-BODY_SPACE_AFTER  = 0
-BODY_JC           = "both"        # full justification
-BODY_LEFT_INDENT  = 980           # twips (matches majority of body paras)
-BODY_RIGHT_INDENT = 744
-BODY_FIRST_LINE   = 720           # twips (0.5 inch first line indent)
+BODY_FONT        = "Times New Roman"
+BODY_SIZE_PT     = 12.0
+BODY_LINE_TWIPS  = 360          # 1.5 line spacing
+BODY_LINE_RULE   = "auto"
+BODY_JC          = "both"       # full justification
+BODY_SPACE_AFTER = 0
+BODY_LEFT_TWIPS  = 980
+BODY_RIGHT_TWIPS = 744
+BODY_FIRST_LINE  = 720          # 0.5 inch first-line indent
 
-HEADING2_SPACE_BEFORE = 280       # twips (~18pt)
-HEADING2_SPACE_AFTER  = 80        # twips (~4pt)
-HEADING3_SPACE_BEFORE = 220       # twips (~14pt)
+H2_SPACE_BEFORE  = 280          # ~18pt
+H2_SPACE_AFTER   = 80           # ~4pt
+H3_SPACE_BEFORE  = 220          # ~14pt
+H3_SPACE_AFTER   = 40
 
-# Styles we consider "body text" — will be justified + font-fixed
+# Styles that are body prose
 BODY_STYLES = {'normal', 'body text', 'default paragraph font', 'no spacing'}
 
-# Styles we never touch
+# Styles never touched
 SKIP_STYLES = {
-    'heading 1', 'heading 2', 'heading 3', 'heading 4',
-    'title', 'subtitle', 'caption', 'footnote text',
-    'header', 'footer', 'toc 1', 'toc 2', 'toc 3',
-    'list paragraph', 'list bullet', 'list number',
-    'table contents', 'table heading',
-    'code', 'verbatim', 'preformatted',
+    'heading 1','heading 2','heading 3','heading 4',
+    'title','subtitle','caption','footnote text',
+    'header','footer','toc 1','toc 2','toc 3',
+    'list paragraph','list bullet','list number',
+    'table contents','table heading','code','verbatim',
 }
+
+# Chapter-level titles — these always start on a NEW PAGE
+CHAPTER_TITLES = {
+    'abstract', 'acknowledgement', 'acknowledgements',
+    'acknowledgment', 'acknowledgments',
+    'contents', 'table of contents',
+    'list of figures', 'list of tables', 'list of acronyms',
+    'references', 'bibliography',
+    'conclusion', 'conclusions',
+    'introduction',
+}
+CHAPTER_LABEL_RE = re.compile(r'^chapter\s+\d+$', re.I)
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-def is_body_paragraph(para):
-    """True if this paragraph should have full body formatting applied."""
-    style = para.style.name.lower()
-    if any(skip in style for skip in SKIP_STYLES):
-        return False
-    if style not in BODY_STYLES and not style.startswith('normal'):
-        return False
-    txt = para.text.strip()
-    if not txt:
-        return False
-    # Skip TOC-like lines (manual dot leaders)
-    if txt.count('…') > 2 or txt.count('.....') > 2:
-        return False
-    # Must be actual prose: >=15 words with sentence punctuation
-    # Protects cover page, signatures, labels, certificate lines
-    words = txt.split()
-    if len(words) < 15:
-        return False
-    if not any(c in txt for c in ['.', ',']):
-        return False
-    # Skip paragraphs that are primarily images
-    if para._element.findall('.//' + qn('w:drawing')) and len(words) < 5:
-        return False
-    return True
-
-
-def set_ppr_attr(ppr, tag, attrs):
-    """Set or replace a child element in <w:pPr>."""
-    existing = ppr.find(qn(tag))
-    if existing is not None:
-        ppr.remove(existing)
-    el = OxmlElement(tag)
-    for k, v in attrs.items():
-        el.set(qn(k), str(v))
-    ppr.append(el)
-    return el
-
-
 def ensure_ppr(para):
-    """Get or create <w:pPr> for a paragraph."""
     ppr = para._element.find(qn('w:pPr'))
     if ppr is None:
         ppr = OxmlElement('w:pPr')
@@ -118,128 +90,259 @@ def ensure_ppr(para):
     return ppr
 
 
-def fix_paragraph_format(para, report_mode=False):
-    """Apply correct body formatting to a single paragraph. Returns change description or None."""
-    changes = []
+def set_child(parent, tag, attrs):
+    existing = parent.find(qn(tag))
+    if existing is not None:
+        parent.remove(existing)
+    el = OxmlElement(tag)
+    for k, v in attrs.items():
+        el.set(qn(k), str(v))
+    parent.append(el)
+    return el
+
+
+def has_page_break(para):
+    for br in para._element.findall('.//' + qn('w:br')):
+        if br.get(qn('w:type')) == 'page':
+            return True
+    return False
+
+
+def add_page_break_before(para):
+    """Add a page break before this paragraph using <w:pageBreakBefore>."""
     ppr = ensure_ppr(para)
-    pf = para.paragraph_format
-
-    # 1. Justification
-    jc = ppr.find(qn('w:jc'))
-    current_jc = jc.get(qn('w:val')) if jc is not None else None
-    if current_jc != 'both':
-        changes.append(f"justify: {current_jc!r}→both")
-        if not report_mode:
-            set_ppr_attr(ppr, 'w:jc', {'w:val': 'both'})
-
-    # 2. Line spacing
-    spacing = ppr.find(qn('w:spacing'))
-    current_line = spacing.get(qn('w:line')) if spacing is not None else None
-    if current_line != str(BODY_LINE_SPACING):
-        changes.append(f"line_spacing: {current_line}→{BODY_LINE_SPACING}")
-        if not report_mode:
-            if spacing is None:
-                spacing = OxmlElement('w:spacing')
-                ppr.append(spacing)
-            spacing.set(qn('w:line'), str(BODY_LINE_SPACING))
-            spacing.set(qn('w:lineRule'), BODY_LINE_RULE)
-            spacing.set(qn('w:after'), str(BODY_SPACE_AFTER))
-            if not spacing.get(qn('w:before')):
-                spacing.set(qn('w:before'), str(BODY_SPACE_BEFORE))
-
-    # 3. Widow control (prevent single lines at top/bottom of page)
-    wc = ppr.find(qn('w:widowControl'))
-    if wc is None or wc.get(qn('w:val')) not in ('0', 'false'):
-        changes.append("widowControl→0")
-        if not report_mode:
-            set_ppr_attr(ppr, 'w:widowControl', {'w:val': '0'})
-
-    # 4. Font and size on all runs
-    for run in para.runs:
-        if not run.text.strip():
-            continue
-        rpr = run._r.find(qn('w:rPr'))
-        if rpr is None:
-            rpr = OxmlElement('w:rPr')
-            run._r.insert(0, rpr)
-
-        # Font name
-        rfonts = rpr.find(qn('w:rFonts'))
-        if rfonts is None:
-            rfonts = OxmlElement('w:rFonts')
-            rpr.insert(0, rfonts)
-        for attr in ['w:ascii', 'w:hAnsi', 'w:cs', 'w:eastAsia']:
-            if rfonts.get(qn(attr)) != BODY_FONT_NAME:
-                if not report_mode:
-                    rfonts.set(qn(attr), BODY_FONT_NAME)
-
-        # Font size (sz = half-points, so 12pt = 24)
-        sz_val = str(int(BODY_FONT_SIZE_PT * 2))
-        sz = rpr.find(qn('w:sz'))
-        szCs = rpr.find(qn('w:szCs'))
-        current_sz = sz.get(qn('w:val')) if sz is not None else None
-        if current_sz not in (sz_val, str(int(BODY_FONT_SIZE_PT * 2) + 1)):
-            if current_sz is not None:
-                changes.append(f"font_size: {int(current_sz)//2}pt→{BODY_FONT_SIZE_PT}pt")
-            if not report_mode:
-                if sz is None:
-                    sz = OxmlElement('w:sz'); rpr.append(sz)
-                sz.set(qn('w:val'), sz_val)
-                if szCs is None:
-                    szCs = OxmlElement('w:szCs'); rpr.append(szCs)
-                szCs.set(qn('w:val'), sz_val)
-
-    return changes if changes else None
+    pb = ppr.find(qn('w:pageBreakBefore'))
+    if pb is None:
+        pb = OxmlElement('w:pageBreakBefore')
+        ppr.insert(0, pb)
+    pb.set(qn('w:val'), '1')
 
 
-def fix_heading_spacing(para, report_mode=False):
-    """Normalize heading spacing."""
+def remove_page_break_before(para):
+    """Remove any <w:pageBreakBefore> from a paragraph."""
+    ppr = para._element.find(qn('w:pPr'))
+    if ppr is not None:
+        pb = ppr.find(qn('w:pageBreakBefore'))
+        if pb is not None:
+            ppr.remove(pb)
+
+
+def is_chapter_title(para):
+    """True if this paragraph is a chapter-level title that should start a new page."""
+    txt  = para.text.strip()
+    low  = txt.lower()
     style = para.style.name.lower()
-    changes = []
-    ppr = ensure_ppr(para)
 
-    if 'heading 2' in style:
-        spacing = ppr.find(qn('w:spacing'))
-        if spacing is None:
-            spacing = OxmlElement('w:spacing')
-            ppr.append(spacing)
-        before = spacing.get(qn('w:before'))
-        after  = spacing.get(qn('w:after'))
-        if before != str(HEADING2_SPACE_BEFORE) or after != str(HEADING2_SPACE_AFTER):
-            changes.append(f"H2 spacing before/after")
-            if not report_mode:
-                spacing.set(qn('w:before'), str(HEADING2_SPACE_BEFORE))
-                spacing.set(qn('w:after'),  str(HEADING2_SPACE_AFTER))
-
-    elif 'heading 3' in style:
-        spacing = ppr.find(qn('w:spacing'))
-        if spacing is None:
-            spacing = OxmlElement('w:spacing')
-            ppr.append(spacing)
-        before = spacing.get(qn('w:before'))
-        if before != str(HEADING3_SPACE_BEFORE):
-            changes.append(f"H3 spacing before")
-            if not report_mode:
-                spacing.set(qn('w:before'), str(HEADING3_SPACE_BEFORE))
-
-    return changes if changes else None
+    # "CHAPTER X" label paragraphs (style=normal)
+    if CHAPTER_LABEL_RE.match(txt):
+        return True
+    # Known title words in normal style
+    if low in CHAPTER_TITLES and style == 'normal':
+        return True
+    return False
 
 
-# ─── TOC REBUILD ─────────────────────────────────────────────────────────────
+def is_body_para(para):
+    """True if this paragraph should receive full body formatting."""
+    txt = para.text.strip()
+    if not txt:
+        return False
+    if para._element.findall('.//' + qn('w:drawing')):
+        return False
+    if (para._element.findall('.//' + qn('m:oMath')) or
+            para._element.findall('.//' + qn('m:oMathPara'))):
+        return False
+    style = para.style.name.lower()
+    if any(s in style for s in SKIP_STYLES):
+        return False
+    if style not in BODY_STYLES and not style.startswith('normal'):
+        return False
+    words = txt.split()
+    if len(words) < 15:
+        return False
+    if not any(c in txt for c in ['.', ',']):
+        return False
+    if txt.count('…') > 2 or txt.count('.....') > 2:
+        return False
+    return True
+
+
+# ─── FIX FUNCTIONS ───────────────────────────────────────────────────────────
+
+def remove_empty_paras_before_heading(doc, report=False):
+    """Delete stray empty paragraphs that appear immediately before a heading."""
+    paras    = list(doc.paragraphs)
+    body     = doc.element.body
+    removed  = 0
+
+    # Build set of paragraph elements to remove
+    to_remove = set()
+    for i, para in enumerate(paras):
+        style = para.style.name
+        if not (style.startswith('Heading') and para.text.strip()):
+            continue
+        # Walk backwards while empty
+        j = i - 1
+        while j >= 0:
+            prev = paras[j]
+            if prev.text.strip():
+                break
+            to_remove.add(id(prev._element))
+            j -= 1
+
+    for para in paras:
+        if id(para._element) in to_remove:
+            if not report:
+                try:
+                    body.remove(para._element)
+                except ValueError:
+                    pass
+            removed += 1
+
+    return removed
+
+
+def fix_chapter_page_breaks(doc, report=False):
+    """Ensure every chapter title starts on a new page."""
+    added   = 0
+    removed = 0
+    for para in doc.paragraphs:
+        if is_chapter_title(para):
+            if not has_page_break(para):
+                if not report:
+                    add_page_break_before(para)
+                added += 1
+        else:
+            # Remove spurious page-break-before from non-chapter elements
+            ppr = para._element.find(qn('w:pPr'))
+            if ppr is not None:
+                pb = ppr.find(qn('w:pageBreakBefore'))
+                if pb is not None and pb.get(qn('w:val')) == '1':
+                    if not report:
+                        ppr.remove(pb)
+                    removed += 1
+    return added, removed
+
+
+def fix_body_formatting(doc, report=False):
+    """Justify, font, line-spacing on all body paragraphs."""
+    fixed = 0
+    for para in doc.paragraphs:
+        if not is_body_para(para):
+            continue
+        changed = False
+        ppr = ensure_ppr(para)
+
+        # Justification
+        jc = ppr.find(qn('w:jc'))
+        if jc is None or jc.get(qn('w:val')) != 'both':
+            if not report:
+                set_child(ppr, 'w:jc', {'w:val': 'both'})
+            changed = True
+
+        # Line spacing
+        sp = ppr.find(qn('w:spacing'))
+        if sp is None or sp.get(qn('w:line')) != str(BODY_LINE_TWIPS):
+            if not report:
+                if sp is None:
+                    sp = OxmlElement('w:spacing')
+                    ppr.append(sp)
+                sp.set(qn('w:line'),     str(BODY_LINE_TWIPS))
+                sp.set(qn('w:lineRule'), BODY_LINE_RULE)
+                sp.set(qn('w:after'),    str(BODY_SPACE_AFTER))
+            changed = True
+
+        # Widow control
+        wc = ppr.find(qn('w:widowControl'))
+        if wc is None:
+            if not report:
+                set_child(ppr, 'w:widowControl', {'w:val': '0'})
+            changed = True
+
+        # Font + size on runs
+        sz_val = str(int(BODY_SIZE_PT * 2))
+        for run in para.runs:
+            if not run.text.strip():
+                continue
+            rpr = run._r.find(qn('w:rPr'))
+            if rpr is None:
+                rpr = OxmlElement('w:rPr')
+                run._r.insert(0, rpr)
+
+            rf = rpr.find(qn('w:rFonts'))
+            if rf is None:
+                rf = OxmlElement('w:rFonts')
+                rpr.insert(0, rf)
+            for attr in ['w:ascii', 'w:hAnsi', 'w:cs', 'w:eastAsia']:
+                if rf.get(qn(attr)) != BODY_FONT and not report:
+                    rf.set(qn(attr), BODY_FONT)
+                    changed = True
+
+            sz = rpr.find(qn('w:sz'))
+            if sz is None or sz.get(qn('w:val')) != sz_val:
+                if not report:
+                    if sz is None:
+                        sz = OxmlElement('w:sz')
+                        rpr.append(sz)
+                    sz.set(qn('w:val'), sz_val)
+                    szcs = rpr.find(qn('w:szCs'))
+                    if szcs is None:
+                        szcs = OxmlElement('w:szCs')
+                        rpr.append(szcs)
+                    szcs.set(qn('w:val'), sz_val)
+                changed = True
+
+        if changed:
+            fixed += 1
+    return fixed
+
+
+def fix_heading_spacing(doc, report=False):
+    """Normalize heading space-before/after and remove extra blank lines."""
+    fixed = 0
+    for para in doc.paragraphs:
+        style = para.style.name.lower()
+        if not para.text.strip():
+            continue
+        ppr = ensure_ppr(para)
+        changed = False
+
+        if 'heading 2' in style:
+            sp = ppr.find(qn('w:spacing'))
+            if sp is None:
+                sp = OxmlElement('w:spacing'); ppr.append(sp)
+            if (sp.get(qn('w:before')) != str(H2_SPACE_BEFORE) or
+                    sp.get(qn('w:after')) != str(H2_SPACE_AFTER)):
+                if not report:
+                    sp.set(qn('w:before'), str(H2_SPACE_BEFORE))
+                    sp.set(qn('w:after'),  str(H2_SPACE_AFTER))
+                changed = True
+
+        elif 'heading 3' in style:
+            sp = ppr.find(qn('w:spacing'))
+            if sp is None:
+                sp = OxmlElement('w:spacing'); ppr.append(sp)
+            if (sp.get(qn('w:before')) != str(H3_SPACE_BEFORE) or
+                    sp.get(qn('w:after')) != str(H3_SPACE_AFTER)):
+                if not report:
+                    sp.set(qn('w:before'), str(H3_SPACE_BEFORE))
+                    sp.set(qn('w:after'),  str(H3_SPACE_AFTER))
+                changed = True
+
+        if changed:
+            fixed += 1
+    return fixed
+
+
+# ─── TOC FIELD ───────────────────────────────────────────────────────────────
 
 def inject_toc_field(doc):
-    """
-    Replace manual TOC paragraphs (lines with …………N) with a real Word TOC field.
-    The field auto-updates when the document is opened in Word or refreshed by LibreOffice.
-    
-    Finds the paragraph block that contains the manual TOC, removes those paragraphs,
-    inserts a proper { TOC \\o "1-3" \\h \\z \\u } field in their place.
-    """
-    # Find the range of TOC paragraphs
+    """Replace manual dot-leader TOC with a Word auto-TOC field."""
+    paras = list(doc.paragraphs)
+    body  = doc.element.body
+
     toc_start = None
     toc_end   = None
-    paras = list(doc.paragraphs)
-
     for i, para in enumerate(paras):
         txt = para.text.strip()
         if txt.count('…') > 3 or '........' in txt:
@@ -248,125 +351,88 @@ def inject_toc_field(doc):
             toc_end = i
 
     if toc_start is None:
-        print("  [TOC] No manual TOC entries found — skipping")
+        print("  [TOC] No manual TOC found — skipping")
         return False
 
-    print(f"  [TOC] Found manual TOC at paragraphs {toc_start}–{toc_end}")
+    toc_xml = (
+        '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:pPr><w:jc w:val="center"/></w:pPr>'
+        '<w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:t>Open in Word and press Ctrl+A then F9 to update page numbers.</w:t></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+        '</w:p>'
+    )
+    toc_el  = etree.fromstring(toc_xml)
+    old_els = [paras[i]._element for i in range(toc_start, toc_end + 1)]
 
-    # Get the parent body element
-    body = doc.element.body
-
-    # Find actual XML elements for the TOC range
-    toc_para_elements = [paras[i]._element for i in range(toc_start, toc_end + 1)]
-
-    # Build the TOC field paragraph XML
-    # Word TOC field: { TOC \o "1-3" \h \z \u }
-    toc_xml = '''<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:pPr>
-    <w:pStyle w:val="TOCHeading"/>
-    <w:jc w:val="center"/>
-  </w:pPr>
-  <w:r>
-    <w:fldChar w:fldCharType="begin" w:dirty="true"/>
-  </w:r>
-  <w:r>
-    <w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText>
-  </w:r>
-  <w:r>
-    <w:fldChar w:fldCharType="separate"/>
-  </w:r>
-  <w:r>
-    <w:t>Right-click and "Update Field" in Word, or press F9 to refresh page numbers.</w:t>
-  </w:r>
-  <w:r>
-    <w:fldChar w:fldCharType="end"/>
-  </w:r>
-</w:p>'''
-
-    toc_element = etree.fromstring(toc_xml)
-
-    # Insert the new TOC field before the first TOC paragraph
-    first_toc = toc_para_elements[0]
-    body.insert(list(body).index(first_toc), toc_element)
-
-    # Remove all old manual TOC paragraphs
-    for el in toc_para_elements:
+    body.insert(list(body).index(old_els[0]), toc_el)
+    for el in old_els:
         try:
             body.remove(el)
         except ValueError:
-            pass  # already removed or not direct child
+            pass
 
-    print(f"  [TOC] Injected Word TOC field (replaces {len(toc_para_elements)} manual entries)")
+    print(f"  [TOC] Injected Word auto-TOC field (replaced {len(old_els)} manual entries)")
+    print(f"  [TOC] → Open output in Word, press Ctrl+A then F9 to refresh page numbers")
     return True
 
 
-# ─── LIBREOFFICE REFRESH ──────────────────────────────────────────────────────
+# ─── LIBREOFFICE REFRESH ─────────────────────────────────────────────────────
 
-def libreoffice_refresh(input_path: Path, output_path: Path) -> bool:
-    """
-    Use LibreOffice headless to open and re-save the docx.
-    This forces field recalculation (TOC page numbers, etc.) and
-    correct repagination based on final content length.
-    """
+def libreoffice_refresh(path: Path) -> bool:
     soffice = shutil.which('soffice') or shutil.which('libreoffice')
     if not soffice:
-        print("  [refresh] LibreOffice not found — install with: apt install libreoffice")
-        print("  [refresh] Skipping repagination step")
+        print("  [refresh] LibreOffice not installed — skipping")
+        print("  [refresh] Install with: sudo apt install libreoffice")
         return False
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_input = Path(tmpdir) / input_path.name
-        shutil.copy2(input_path, tmp_input)
-
-        cmd = [
-            soffice, '--headless', '--norestore',
-            '--convert-to', 'docx',
-            '--outdir', tmpdir,
-            str(tmp_input)
-        ]
+    with tempfile.TemporaryDirectory() as tmp:
+        import shutil as _sh
+        src = Path(tmp) / path.name
+        _sh.copy2(path, src)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            converted = list(Path(tmpdir).glob('*.docx'))
-            converted = [f for f in converted if f != tmp_input]
-            if converted:
-                shutil.copy2(converted[0], output_path)
-                print(f"  [refresh] LibreOffice repagination complete")
+            subprocess.run(
+                [soffice, '--headless', '--norestore',
+                 '--convert-to', 'docx', '--outdir', tmp, str(src)],
+                capture_output=True, timeout=120
+            )
+            out = [f for f in Path(tmp).glob('*.docx') if f != src]
+            if out:
+                _sh.copy2(out[0], path)
+                print("  [refresh] LibreOffice repagination done")
                 return True
-            else:
-                print(f"  [refresh] LibreOffice ran but no output found")
-                return False
-        except subprocess.TimeoutExpired:
-            print("  [refresh] LibreOffice timed out after 120s")
-            return False
         except Exception as e:
             print(f"  [refresh] LibreOffice error: {e}")
-            return False
+    return False
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Fix formatting of a humanized .docx — never touches text content",
+        description="Format a report .docx — never changes text content",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-What this fixes (text content is NEVER modified):
-  - Full justification on all body paragraphs
-  - Times New Roman 12pt font consistency
-  - 1.5 line spacing on body text
-  - Heading space-before / space-after normalization
-  - Widow/orphan control (prevents single lines on page breaks)
-  - TOC: replaces manual "……1" strings with Word auto-TOC field
-  - LibreOffice repagination (if installed) to refresh TOC page numbers
+Fixes applied:
+  • Empty paragraphs before headings removed
+  • Chapter titles (CHAPTER X / ABSTRACT / etc.) forced to new page
+  • Body text: full justification, Times New Roman 12pt, 1.5 spacing
+  • Heading 2/3 spacing normalized
+  • Widow/orphan control on body text
+  • Manual TOC replaced with Word auto-field (press F9 to update)
+  • LibreOffice headless repagination (if installed)
 
-Usage after humanizing:
-  python3 format_doc.py humanized.docx formatted.docx
+Full pipeline:
+  python3 humanize_doc.py  report.docx  humanized.docx
+  python3 format_doc.py    humanized.docx  final.docx
+  → open final.docx in Word → Ctrl+A → F9 → Save
         """)
-    ap.add_argument("input",  help="Input docx (humanized)")
-    ap.add_argument("output", help="Output docx (formatted)")
+    ap.add_argument("input")
+    ap.add_argument("output")
+    ap.add_argument("--report",     action="store_true", help="Show changes without writing")
     ap.add_argument("--no-toc",     action="store_true", help="Skip TOC field injection")
     ap.add_argument("--no-refresh", action="store_true", help="Skip LibreOffice repagination")
-    ap.add_argument("--report",     action="store_true", help="Show what would change, don't write")
     args = ap.parse_args()
 
     src = Path(args.input)
@@ -383,59 +449,51 @@ Usage after humanizing:
 
     doc = Document(str(src))
 
-    body_fixed    = 0
-    heading_fixed = 0
-    report_lines  = []
+    # 1. Remove empty paragraphs before headings
+    n_empty = remove_empty_paras_before_heading(doc, report=args.report)
+    print(f"  Empty paras removed before headings : {n_empty}")
 
-    print("Scanning paragraphs...")
-    for para in doc.paragraphs:
-        style = para.style.name.lower()
+    # 2. Chapter page breaks
+    n_added, n_removed = fix_chapter_page_breaks(doc, report=args.report)
+    print(f"  Chapter page-breaks added           : {n_added}")
+    print(f"  Spurious page-breaks removed        : {n_removed}")
 
-        if is_body_paragraph(para):
-            changes = fix_paragraph_format(para, report_mode=args.report)
-            if changes:
-                body_fixed += 1
-                if args.report and len(report_lines) < 20:
-                    report_lines.append(f"  BODY [{para.text[:50]}]: {', '.join(changes)}")
+    # 3. Body formatting
+    n_body = fix_body_formatting(doc, report=args.report)
+    print(f"  Body paragraphs reformatted         : {n_body}")
 
-        elif any(h in style for h in ['heading 2', 'heading 3']):
-            changes = fix_heading_spacing(para, report_mode=args.report)
-            if changes:
-                heading_fixed += 1
-
-    print(f"  Body paragraphs fixed : {body_fixed}")
-    print(f"  Heading spacing fixed : {heading_fixed}")
+    # 4. Heading spacing
+    n_hdg = fix_heading_spacing(doc, report=args.report)
+    print(f"  Heading spacings normalized         : {n_hdg}")
 
     if args.report:
-        print(f"\nSample changes (first 20):")
-        for line in report_lines:
-            print(line)
+        print("\n(Report mode — nothing written)")
         return
 
-    # TOC rebuild
-    toc_injected = False
+    # 5. TOC
     if not args.no_toc:
         print("\nRebuilding TOC...")
-        toc_injected = inject_toc_field(doc)
+        inject_toc_field(doc)
 
-    # Save intermediate
-    out_path = Path(args.output)
-    doc.save(str(out_path))
-    print(f"\nSaved formatted document → {out_path}")
+    # 6. Save
+    out = Path(args.output)
+    doc.save(str(out))
+    print(f"\nSaved → {out}")
 
-    # LibreOffice repagination
+    # 7. LibreOffice repagination
     if not args.no_refresh:
         print("\nRunning LibreOffice repagination...")
-        refreshed = libreoffice_refresh(out_path, out_path)
-        if not refreshed and toc_injected:
-            print("  NOTE: Open the output in Word and press Ctrl+A then F9 to update TOC page numbers.")
+        libreoffice_refresh(out)
 
     print(f"\n✓  Done!")
-    print(f"   {body_fixed} body paragraphs justified + font-normalized")
-    print(f"   {heading_fixed} heading spacings corrected")
-    if toc_injected:
-        print(f"   TOC field injected — open in Word and press F9 to refresh page numbers")
+    print(f"   {n_empty} empty gaps removed")
+    print(f"   {n_added} chapter page-breaks added")
+    print(f"   {n_body} body paragraphs reformatted")
+    print(f"   {n_hdg} heading spacings fixed")
     print()
+    print("   → Open the output in Word")
+    print("   → Press Ctrl+A then F9")
+    print("   → Save — TOC page numbers will be correct\n")
 
 
 if __name__ == "__main__":
